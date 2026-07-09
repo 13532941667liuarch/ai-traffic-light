@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AI 红绿灯 — 模仿 AI Light 的 push + timeout 状态模型"""
+"""AI 红绿灯 — 监控 WorkBuddy 工作区创建 + 状态文件 push"""
 
 import tkinter as tk
 import json
@@ -8,8 +8,6 @@ import time
 import threading
 
 STATUS_FILE = os.path.expanduser('~/.workbuddy/ai_status.json')
-
-# WorkBuddy 所有工作区的根目录
 WB_ROOT = os.path.expanduser('~/WorkBuddy')
 
 STATUS_CONFIG = {
@@ -18,8 +16,8 @@ STATUS_CONFIG = {
     'idle':    {'color': '#00aa00', 'glow': '#44ff44', 'label': '就绪'},
 }
 
-# 超时：working 状态持续超过此秒数无新信号 → 自动回退 idle
 WORKING_TIMEOUT = 3
+STARTUP_LOOKBACK = 300  # 启动时回溯窗口（秒）
 
 
 class TrafficLight:
@@ -39,33 +37,29 @@ class TrafficLight:
 
         self.current_status = 'idle'
         self.light_ids = {}
-        self.label_id = None
         self._draw_lights()
         self._draw_label()
 
-        self._offset_x = 0
-        self._offset_y = 0
+        self._offset_x = self._offset_y = 0
         self.canvas.bind('<Button-1>', self._on_drag_start)
         self.canvas.bind('<B1-Motion>', self._on_drag_move)
 
-        # 上次收到「工作中」信号的时间
-        self._last_work_signal = 0
+        self._last_work_signal = time.time()
+        self._startup_time = time.time()
+        self._latest_workspace_birth = 0  # 最新工作区创建时间
 
         self._update_display()
         self._start_watcher()
 
-    # ─── UI 绘制 ────────────────────────────────
+    # ─── UI ───────────────────────────────────
 
     def _draw_rounded_bg(self):
         r = 10
-        self._create_rounded_rect(2, 2, 62, 174, r,
-                                  fill='#2a2a2a', outline='#3a3a3a', width=1)
-
-    def _create_rounded_rect(self, x1, y1, x2, y2, r, **kw):
-        pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
-               x2, y2 - r, x2, y2, x2 - r, y2, x1 + r, y2,
-               x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-        return self.canvas.create_polygon(pts, smooth=True, **kw)
+        pts = [2+r, 2, 62-r, 2, 62, 2, 62, 2+r,
+               62, 174-r, 62, 174, 62-r, 174, 2+r, 174,
+               2, 174, 2, 174-r, 2, 2+r, 2, 2]
+        self.canvas.create_polygon(pts, smooth=True,
+                                    fill='#2a2a2a', outline='#3a3a3a', width=1)
 
     def _draw_lights(self):
         cx = 32
@@ -88,11 +82,12 @@ class TrafficLight:
             32, 146, text='就绪', fill='#999', font=('Helvetica', 8))
 
     def _on_drag_start(self, ev): self._offset_x, self._offset_y = ev.x, ev.y
+
     def _on_drag_move(self, ev):
         self.root.geometry(f'+{self.root.winfo_pointerx() - self._offset_x}'
                            f'+{self.root.winfo_pointery() - self._offset_y}')
 
-    # ─── 状态控制 ──────────────────────────────
+    # ─── 状态控制 ─────────────────────────────
 
     def set_status(self, status):
         if status == self.current_status:
@@ -102,16 +97,14 @@ class TrafficLight:
         self._save_status()
 
     def _update_display(self):
-        cfg = STATUS_CONFIG[self.current_status]
         for s, (light, glow) in self.light_ids.items():
             if s == self.current_status:
-                self.canvas.itemconfig(light, fill=STATUS_CONFIG[s]['color'],
-                                       outline='#666')
+                self.canvas.itemconfig(light, fill=STATUS_CONFIG[s]['color'], outline='#666')
                 self.canvas.itemconfig(glow, fill=STATUS_CONFIG[s]['glow'])
             else:
                 self.canvas.itemconfig(light, fill='#222', outline='#444')
                 self.canvas.itemconfig(glow, fill='')
-        self.canvas.itemconfig(self.label_id, text=cfg['label'])
+        self.canvas.itemconfig(self.label_id, text=STATUS_CONFIG[self.current_status]['label'])
 
     def _save_status(self):
         try:
@@ -122,133 +115,71 @@ class TrafficLight:
         except Exception:
             pass
 
-    # ─── 检测逻辑（模仿 AI Light：push 优先 + timeout 兜底）────
+    # ─── 检测逻辑 ─────────────────────────────
 
     def _detect_work_signal(self):
-        """三种信号，任一命中即判定「工作中」：
-           1. 状态文件 push（最可靠）
-           2. 工作区文件变更（包括 .workbuddy 内部文件）
-           3. 新工作区目录创建（新开对话）
-        """
         now = time.time()
+        since_start = now - self._startup_time
+        # 启动后前 10 秒用宽窗口（覆盖崩溃重启场景）
+        lookback = STARTUP_LOOKBACK if since_start < 10 else 3
 
-        # 信号 1：状态文件
+        # 信号 1：状态文件 push
         try:
             if os.path.exists(STATUS_FILE):
                 with open(STATUS_FILE) as f:
                     data = json.load(f)
                 if data.get('status') == 'working':
-                    mtime = os.path.getmtime(STATUS_FILE)
-                    if now - mtime < WORKING_TIMEOUT:
+                    if now - os.path.getmtime(STATUS_FILE) < WORKING_TIMEOUT:
                         return True
         except Exception:
             pass
 
-        # 信号 2：工作区文件变更
-        if self._has_recent_file_changes(now):
+        # 信号 2：新工作区创建
+        self._scan_workspaces(now)
+        if self._latest_workspace_birth > 0 and (now - self._latest_workspace_birth) < 3:
             return True
 
-        # 信号 3：新工作区创建
-        return self._has_new_workspace(now)
+        return False
 
-    def _has_recent_file_changes(self, now):
-        """扫描 ~/WorkBuddy/ 下所有工作区，检测最近 3 秒的文件变更。
-           不跳过 .workbuddy（那是 WorkBuddy 真正写文件的地方）。"""
+    def _scan_workspaces(self, now):
+        """扫描今天的工作区，记录最新创建时间"""
+        today = time.strftime('%Y-%m-%d')
         latest = 0
-
-        def scan_dir(path):
-            nonlocal latest
-            try:
-                for entry in os.scandir(path):
-                    name = entry.name
-                    # 只跳过 .git / node_modules 等无关目录，不跳过 .workbuddy
-                    if name in ('.git', 'node_modules', '__pycache__') or name.startswith('._'):
-                        continue
-                    try:
-                        if entry.is_file():
-                            m = entry.stat().st_mtime
-                            if m > latest: latest = m
-                        elif entry.is_dir():
-                            # 深入两层：dir/sub/file
-                            try:
-                                for sub in os.scandir(entry.path):
-                                    sname = sub.name
-                                    if sname in ('.git', 'node_modules', '__pycache__') or sname.startswith('._'):
-                                        continue
-                                    try:
-                                        if sub.is_file():
-                                            m = sub.stat().st_mtime
-                                            if m > latest: latest = m
-                                        elif sub.is_dir():
-                                            # 再深入一层（如 .workbuddy/memory/）
-                                            try:
-                                                for leaf in os.scandir(sub.path):
-                                                    if leaf.is_file():
-                                                        m = leaf.stat().st_mtime
-                                                        if m > latest: latest = m
-                                            except OSError: pass
-                                    except OSError: pass
-                            except OSError: pass
-                    except OSError: pass
-            except OSError: pass
-
-        # 只扫描今日的工作区（后缀匹配当前日期前缀）
-        today_prefix = time.strftime('%Y-%m-%d')
         try:
             for entry in os.scandir(WB_ROOT):
-                if not entry.is_dir():
-                    continue
-                name = entry.name
-                # 只看今天的工作区
-                if not name.startswith(today_prefix):
-                    continue
-                scan_dir(entry.path)
-        except OSError:
-            pass
-
-        try:
-            m = os.path.getmtime(STATUS_FILE)
-            if m > latest: latest = m
-        except OSError: pass
-
-        return (now - latest) < 3
-
-    def _has_new_workspace(self, now):
-        """检查是否最近有新工作区目录被创建（新开对话的标志）"""
-        today_prefix = time.strftime('%Y-%m-%d')
-        try:
-            for entry in os.scandir(WB_ROOT):
-                if not entry.is_dir() or not entry.name.startswith(today_prefix):
+                if not entry.is_dir() or not entry.name.startswith(today):
                     continue
                 try:
-                    # 目录创建时间在 3 秒内
-                    ctime = entry.stat().st_ctime
-                    if now - ctime < 3:
-                        return True
+                    bt = entry.stat().st_birthtime
+                    if bt > latest:
+                        latest = bt
                 except OSError:
                     pass
         except OSError:
             pass
-        return False
+        self._latest_workspace_birth = latest
+
+    # ─── 主循环（带自愈）─────────────────────
 
     def _watcher_loop(self):
         while True:
-            now = time.time()
+            try:
+                now = time.time()
+                work_signal = self._detect_work_signal()
 
-            work_signal = self._detect_work_signal()
+                if work_signal:
+                    self._last_work_signal = now
+                    target = 'working'
+                else:
+                    target = 'idle' if (now - self._last_work_signal) > WORKING_TIMEOUT else self.current_status
 
-            if work_signal:
-                self._last_work_signal = now
-                target = 'working'
-            else:
-                # 超时：超过 WORKING_TIMEOUT 秒无新信号 → idle
-                target = 'idle' if (now - self._last_work_signal) > WORKING_TIMEOUT else self.current_status
+                if target != self.current_status:
+                    self.current_status = target
+                    self.root.after(0, self._update_display)
 
-            if target != self.current_status:
-                self.current_status = target
-                self.root.after(0, self._update_display)
-
-            time.sleep(0.5)
+                time.sleep(0.5)
+            except Exception:
+                time.sleep(1)
 
     def _start_watcher(self):
         t = threading.Thread(target=self._watcher_loop, daemon=True)

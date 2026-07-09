@@ -21,7 +21,7 @@ STATUS_CONFIG = {
 }
 
 # 超时：working 状态持续超过此秒数无新信号 → 自动回退 idle
-WORKING_TIMEOUT = 5
+WORKING_TIMEOUT = 3
 
 
 class TrafficLight:

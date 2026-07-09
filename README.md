@@ -2,7 +2,7 @@
 
 > WorkBuddy 桌面状态小组件——用红绿灯显示你的 AI 助手在干什么。
 
-设计借鉴了 [AI Light](https://github.com/LeoKemp223/ai-light) 的红绿灯状态模型，通过**自动检测工作区文件变更 + 子进程活动**来判断 WorkBuddy 是否正在工作，完全无需手动操作。
+设计借鉴了 [AI Light](https://github.com/LeoKemp223/ai-light) 的 push + timeout 状态模型：WorkBuddy 干活时主动推送状态信号，红绿灯响应后 5 秒无新信号自动回绿，绝不卡死。
 
 ## 效果
 
@@ -32,12 +32,11 @@ python3 traffic_light.py
 
 ## 工作原理
 
-红绿灯每 0.5 秒检测两个信号，任一命中即判定为「工作中」：
+模仿 AI Light 的 push + timeout 模型：
 
-1. **文件变更** — 工作区目录内有文件被修改（3 秒窗口）
-2. **子进程活动** — 工作区路径下出现额外的 bash/node 等子进程
-
-两个信号同时失效 1.5 秒后，自动切回就绪状态。覆盖所有操作类型：写代码、搜网页、调 API、跑脚本。
+1. **Push 信号** — WorkBuddy 干活时写入 `~/.workbuddy/ai_status.json`（`"status": "working"`）
+2. **文件变更兜底** — 工作区目录内有文件被修改时也能触发（3 秒窗口）
+3. **Timeout 回退** — 5 秒无新信号自动切回就绪，杜绝黄灯卡死
 
 ## 命令行控制
 

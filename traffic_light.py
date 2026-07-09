@@ -9,9 +9,8 @@ import threading
 
 STATUS_FILE = os.path.expanduser('~/.workbuddy/ai_status.json')
 
-# 工作区
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-WORKSPACE_DIR = os.path.dirname(SCRIPT_DIR)
+# WorkBuddy 所有工作区的根目录
+WB_ROOT = os.path.expanduser('~/WorkBuddy')
 IGNORE_DIRS = {'.git', '__pycache__', 'node_modules'}
 
 STATUS_CONFIG = {
@@ -149,32 +148,48 @@ class TrafficLight:
         return self._has_recent_file_changes(now)
 
     def _has_recent_file_changes(self, now):
+        """扫描 ~/WorkBuddy/ 下所有工作区，检测最近 3 秒的文件变更。
+           先用目录 mtime 快速过滤，只对近期有变化的工作区深入扫描。"""
         latest = 0
+        threshold = now - 3
 
-        def scan(path):
+        def scan_dir(path):
             nonlocal latest
             try:
-                for e in os.scandir(path):
-                    if e.name.startswith('.') or e.name in IGNORE_DIRS:
+                for entry in os.scandir(path):
+                    if entry.name.startswith('.') or entry.name in IGNORE_DIRS:
                         continue
                     try:
-                        if e.is_file():
-                            m = e.stat().st_mtime
+                        if entry.is_file():
+                            m = entry.stat().st_mtime
                             if m > latest: latest = m
-                        elif e.is_dir():
+                        elif entry.is_dir():
                             try:
-                                for s in os.scandir(e.path):
-                                    if s.name.startswith('.'): continue
+                                for sub in os.scandir(entry.path):
+                                    if sub.name.startswith('.'): continue
                                     try:
-                                        if s.is_file():
-                                            m = s.stat().st_mtime
+                                        if sub.is_file():
+                                            m = sub.stat().st_mtime
                                             if m > latest: latest = m
                                     except OSError: pass
                             except OSError: pass
                     except OSError: pass
             except OSError: pass
 
-        scan(WORKSPACE_DIR)
+        try:
+            for entry in os.scandir(WB_ROOT):
+                if not entry.is_dir() or not entry.name[0].isdigit():
+                    continue
+                # 快速过滤：目录 mtime 在 3 秒内才深入扫描
+                try:
+                    if entry.stat().st_mtime < threshold:
+                        continue
+                except OSError:
+                    continue
+                scan_dir(entry.path)
+        except OSError:
+            pass
+
         try:
             m = os.path.getmtime(STATUS_FILE)
             if m > latest: latest = m

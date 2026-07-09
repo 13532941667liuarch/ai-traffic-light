@@ -11,7 +11,6 @@ STATUS_FILE = os.path.expanduser('~/.workbuddy/ai_status.json')
 
 # WorkBuddy 所有工作区的根目录
 WB_ROOT = os.path.expanduser('~/WorkBuddy')
-IGNORE_DIRS = {'.git', '__pycache__', 'node_modules'}
 
 STATUS_CONFIG = {
     'waiting': {'color': '#cc0000', 'glow': '#ff4444', 'label': '需要介入'},
@@ -126,9 +125,10 @@ class TrafficLight:
     # ─── 检测逻辑（模仿 AI Light：push 优先 + timeout 兜底）────
 
     def _detect_work_signal(self):
-        """检测是否有「工作中」信号：
-           1. 状态文件写入了 working（push 信号）
-           2. 工作区文件在 3 秒内被修改（被动检测）
+        """三种信号，任一命中即判定「工作中」：
+           1. 状态文件 push（最可靠）
+           2. 工作区文件变更（包括 .workbuddy 内部文件）
+           3. 新工作区目录创建（新开对话）
         """
         now = time.time()
 
@@ -145,46 +145,62 @@ class TrafficLight:
             pass
 
         # 信号 2：工作区文件变更
-        return self._has_recent_file_changes(now)
+        if self._has_recent_file_changes(now):
+            return True
+
+        # 信号 3：新工作区创建
+        return self._has_new_workspace(now)
 
     def _has_recent_file_changes(self, now):
         """扫描 ~/WorkBuddy/ 下所有工作区，检测最近 3 秒的文件变更。
-           先用目录 mtime 快速过滤，只对近期有变化的工作区深入扫描。"""
+           不跳过 .workbuddy（那是 WorkBuddy 真正写文件的地方）。"""
         latest = 0
-        threshold = now - 3
 
         def scan_dir(path):
             nonlocal latest
             try:
                 for entry in os.scandir(path):
-                    if entry.name.startswith('.') or entry.name in IGNORE_DIRS:
+                    name = entry.name
+                    # 只跳过 .git / node_modules 等无关目录，不跳过 .workbuddy
+                    if name in ('.git', 'node_modules', '__pycache__') or name.startswith('._'):
                         continue
                     try:
                         if entry.is_file():
                             m = entry.stat().st_mtime
                             if m > latest: latest = m
                         elif entry.is_dir():
+                            # 深入两层：dir/sub/file
                             try:
                                 for sub in os.scandir(entry.path):
-                                    if sub.name.startswith('.'): continue
+                                    sname = sub.name
+                                    if sname in ('.git', 'node_modules', '__pycache__') or sname.startswith('._'):
+                                        continue
                                     try:
                                         if sub.is_file():
                                             m = sub.stat().st_mtime
                                             if m > latest: latest = m
+                                        elif sub.is_dir():
+                                            # 再深入一层（如 .workbuddy/memory/）
+                                            try:
+                                                for leaf in os.scandir(sub.path):
+                                                    if leaf.is_file():
+                                                        m = leaf.stat().st_mtime
+                                                        if m > latest: latest = m
+                                            except OSError: pass
                                     except OSError: pass
                             except OSError: pass
                     except OSError: pass
             except OSError: pass
 
+        # 只扫描今日的工作区（后缀匹配当前日期前缀）
+        today_prefix = time.strftime('%Y-%m-%d')
         try:
             for entry in os.scandir(WB_ROOT):
-                if not entry.is_dir() or not entry.name[0].isdigit():
+                if not entry.is_dir():
                     continue
-                # 快速过滤：目录 mtime 在 3 秒内才深入扫描
-                try:
-                    if entry.stat().st_mtime < threshold:
-                        continue
-                except OSError:
+                name = entry.name
+                # 只看今天的工作区
+                if not name.startswith(today_prefix):
                     continue
                 scan_dir(entry.path)
         except OSError:
@@ -196,6 +212,24 @@ class TrafficLight:
         except OSError: pass
 
         return (now - latest) < 3
+
+    def _has_new_workspace(self, now):
+        """检查是否最近有新工作区目录被创建（新开对话的标志）"""
+        today_prefix = time.strftime('%Y-%m-%d')
+        try:
+            for entry in os.scandir(WB_ROOT):
+                if not entry.is_dir() or not entry.name.startswith(today_prefix):
+                    continue
+                try:
+                    # 目录创建时间在 3 秒内
+                    ctime = entry.stat().st_ctime
+                    if now - ctime < 3:
+                        return True
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return False
 
     def _watcher_loop(self):
         while True:

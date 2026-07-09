@@ -2,7 +2,7 @@
 
 > WorkBuddy 桌面状态小组件——用红绿灯显示你的 AI 助手在干什么。
 
-设计借鉴了 [AI Light](https://github.com/LeoKemp223/ai-light) 的红绿灯状态模型，但实现方式完全不同：它是一个轻量 Python 脚本，通过读取 JSON 状态文件来更新显示。
+设计借鉴了 [AI Light](https://github.com/LeoKemp223/ai-light) 的红绿灯状态模型，通过**自动检测工作区文件变更 + 子进程活动**来判断 WorkBuddy 是否正在工作，完全无需手动操作。
 
 ## 效果
 
@@ -14,9 +14,9 @@
 
 ## 当前能力范围
 
-**已实现：** 搭配 WorkBuddy 使用。WorkBuddy 会在干活时自动写入状态文件，红绿灯实时响应。
+**已实现：** 搭配 WorkBuddy 使用，**完全自动检测**——WorkBuddy 干活时自动亮黄灯，干完自动回绿，无需任何手动操作。
 
-**需要自行配置：** 如果你想搭配其他 AI 工具（Claude Code、Codex 等），需要在对应工具的 hook 脚本中写入同样的 JSON 文件。本项目不提供这些 hook 配置。
+**需要自行配置：** 想搭配其他 AI 工具（Claude Code、Codex 等），需在对应工具的 hook 里写入状态文件 `~/.workbuddy/ai_status.json`。
 
 ## 安装和运行
 
@@ -32,17 +32,12 @@ python3 traffic_light.py
 
 ## 工作原理
 
-```
-WorkBuddy 干活 → 写入 ~/.workbuddy/ai_status.json → 红绿灯轮询读取 → 更新显示
-```
+红绿灯每 0.5 秒检测两个信号，任一命中即判定为「工作中」：
 
-状态文件格式：
+1. **文件变更** — 工作区目录内有文件被修改（3 秒窗口）
+2. **子进程活动** — 工作区路径下出现额外的 bash/node 等子进程
 
-```json
-{"status": "working", "timestamp": "2026-07-09T12:00:00"}
-```
-
-可选值：`idle` / `working` / `waiting`。超过 2 分钟未更新的 `working` 状态自动回退到 `idle`。
+两个信号同时失效 1.5 秒后，自动切回就绪状态。覆盖所有操作类型：写代码、搜网页、调 API、跑脚本。
 
 ## 命令行控制
 
